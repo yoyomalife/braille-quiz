@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>점자 구구단 퀴즈 · 학생 참여</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<div class="top"><h1>⠿ 점자 구구단 퀴즈</h1><span class="sp"></span><span class="badge" id="who"></span></div>
+<div class="demo" id="demoBar" style="display:none">데모 모드: Firebase 설정 전이라 <b>같은 브라우저의 탭끼리만</b> 연결돼요.</div>
+<div class="wrap" id="app"></div>
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+/* =====================================================================
+   학생 화면 (참여 전용)
+   ===================================================================== */
+let DB;
+const params = new URLSearchParams(location.search);
+const SKEY = "bq_student";
+
+function studentJoin(msg){
+  clearSubs(); clearTick(); setWho("학생");
+  const last = JSON.parse(sessionStorage.getItem(SKEY) || "null");
+  const code = params.get("room") || (last && last.code) || "";
+  $app.innerHTML = `
+  <div class="card" style="max-width:520px;margin:0 auto">
+    <h2>퀴즈 참여하기</h2>
+    ${brailleHTML(numCells(2026), {hlNum:true, style:"--d:12px;--bgap:6px;justify-content:flex-start"})}
+    <label class="f">방 코드 (숫자 4자리)</label>
+    <input class="inp" id="code" inputmode="numeric" maxlength="4" value="${esc(code)}" placeholder="예) 1234">
+    <label class="f">닉네임</label>
+    <input class="inp" id="nick" maxlength="10" value="${esc(last && last.code === code ? last.name : "")}" placeholder="10자 이내">
+    <div class="warn" id="w">${esc(msg || "")}</div>
+    <button class="btn gold big" style="width:100%;margin-top:8px" id="join">입장</button>
+  </div>`;
+  const go = async () => {
+    const w = document.getElementById("w"); const btn = document.getElementById("join");
+    const c = document.getElementById("code").value.trim(), name = document.getElementById("nick").value.trim();
+    if (!/^\d{4}$/.test(c)) { w.textContent = "방 코드 4자리를 확인해 주세요."; return; }
+    if (!name) { w.textContent = "닉네임을 적어 주세요."; return; }
+    btn.disabled = true;
+    try {
+      const pid = await DB.auth.anon();
+      const meta = await DB.get(R(c) + "/meta"); if (!meta) { w.textContent = "그런 방이 없어요. 코드를 다시 확인해 주세요."; btn.disabled = false; return; }
+      const players = (await DB.get(R(c) + "/players")) || {};
+      if (Object.entries(players).some(([id, p]) => p.name === name && id !== pid)) { w.textContent = "이미 쓰고 있는 닉네임이에요. 다른 닉네임을 적어 주세요."; btn.disabled = false; return; }
+      await DB.set(R(c) + "/players/" + pid, {name, joinedAt: TS});
+      sessionStorage.setItem(SKEY, JSON.stringify({code: c, name}));
+      studentRun(c, pid, name);
+    } catch (e) { w.textContent = "입장하지 못했어요. 잠시 후 다시 시도해 주세요."; btn.disabled = false; console.error(e); }
+  };
+  document.getElementById("join").onclick = go;
+  document.getElementById("nick").onkeydown = e => { if (e.key === "Enter") go(); };
+}
+
+function studentRun(code, pid, name){
+  clearSubs(); clearTick(); setWho(`${name} · 방 ${code}`);
+  let meta = null, questions = {}, allAns = {}, pending = {}, reveal = {}, results = {}, joined = true;
+  const myAnswer = i => (allAns[i] && allAns[i][pid]) ? allAns[i][pid].choice : (pending[i] != null ? pending[i] : null);
+  unsubs.push(DB.on(R(code) + "/meta", v => { meta = v; if (!v) { sessionStorage.removeItem(SKEY); studentJoin("선생님이 방을 닫았어요."); return; } render(); }));
+  unsubs.push(DB.on(R(code) + "/questions", v => { questions = v || {}; render(); }));
+  unsubs.push(DB.on(R(code) + "/reveal", v => { reveal = v || {}; render(); }));
+  unsubs.push(DB.on(R(code) + "/results", v => { results = v || {}; render(); }));
+  unsubs.push(DB.on(R(code) + "/answers", v => { allAns = v || {}; if (!v) pending = {}; render(); }));
+  unsubs.push(DB.on(R(code) + "/players/" + pid, v => { if (v == null && joined) { joined = false; sessionStorage.removeItem(SKEY); studentJoin("선생님이 참여를 취소했어요. 다시 입장해 주세요."); } }));
+  const total = () => { let s = 0; for (const qi in results) s += (results[qi][pid] && results[qi][pid].p) || 0; return s; };
+
+  async function answer(k){
+    const i = meta.q; if (myAnswer(i) != null) return;
+    if (meta.limit && DB.now() - meta.startedAt > meta.limit * 1000) return;
+    pending[i] = k; render();
+    try { await DB.set(R(code) + `/answers/${i}/${pid}`, {choice: k, t: TS}); }
+    catch (e) { /* 이미 제출했거나 시간이 지난 경우: 서버 규칙이 거부 */ }
+  }
+
+  function hintHTML(){
+    if (!meta.hint) return "";
+    const cells = [{d:NUMSIGN, lab:"수표", hl:true}, ...["1","2","3","4","5","6","7","8","9","0"].map(k => ({d:DIGIT[k], lab:k})), {d:MUL, lab:"×"}];
+    return `<details class="hint"><summary>숫자 점자표 힌트</summary><div class="hintrow">${cells.map(c => `<div>${brailleHTML([c], {hlNum:true})}<div class="blab">${c.lab}</div></div>`).join("")}</div></details>`;
+  }
+
+  function render(){
+    if (!meta) return; clearTick();
+    const q = questions[meta.q];
+    if (meta.state === "lobby") {
+      $app.innerHTML = `<div class="card center"><h2>${esc(name)} 님, 입장 완료!</h2><p class="big muted">선생님이 문제를 낼 때까지 기다려요.</p>
+        ${brailleHTML(numCells(2026), {hlNum:true, labels:true, style:"--d:min(18px,3vw)"})}<p class="muted small">점자로 쓴 2026 — 훈맹정음 100주년</p></div>`;
+    } else if (meta.state === "question" && q) {
+      const mine = myAnswer(meta.q);
+      $app.innerHTML = `
+      <div class="card center">
+        <div class="row" style="justify-content:space-between"><div class="stat">${meta.q + 1}번 문제</div><div class="timer" id="tm"></div><div class="stat">${total()}점</div></div>
+        ${brailleHTML(problemCells(q.a, q.b), {style:"--d:min(30px,3.6vw);--bgap:min(14px,1.8vw)"})}
+        <div class="choices">${q.choices.map((c, k) => `<button class="ch c${k} ${mine != null ? (mine === k ? "mine" : "dim") : ""}" data-k="${k}" ${mine != null ? "disabled" : ""}><span class="k">${KEYS[k]}</span>${meta.choicesBraille ? brailleHTML(numCells(c)) : c}</button>`).join("")}</div>
+        <p class="big" id="st">${mine != null ? "제출 완료! 정답 공개를 기다려요." : ""}</p>
+        ${hintHTML()}
+      </div>`;
+      $app.querySelectorAll("[data-k]").forEach(b => b.onclick = () => answer(+b.dataset.k));
+      if (meta.limit) {
+        const el = document.getElementById("tm");
+        const upd = () => {
+          const left = Math.max(0, Math.ceil(meta.limit - (DB.now() - meta.startedAt) / 1000)); el.textContent = left + "초"; el.classList.toggle("low", left <= 5);
+          if (left === 0 && myAnswer(meta.q) == null) { $app.querySelectorAll("[data-k]").forEach(b => { b.disabled = true; b.classList.add("dim"); }); document.getElementById("st").textContent = "시간이 끝났어요."; clearTick(); }
+        };
+        upd(); tick = setInterval(upd, 250);
+      }
+    } else if (meta.state === "reveal" && q) {
+      const ans = reveal[meta.q]; const r = (results[meta.q] || {})[pid]; const mine = myAnswer(meta.q);
+      const ok = r ? r.c : false;
+      $app.innerHTML = `
+      <div class="card center">
+        <div class="stat">${meta.q + 1}번 문제</div>
+        <div class="result ${ok ? "ok" : "no"}" style="margin:14px 0">${ok ? "⭕ 정답!" : (mine == null && !r ? "⏱ 미제출" : "❌ 아쉬워요")}</div>
+        ${ok ? `<p class="big"><b>${r.r}번째</b>로 맞혔어요 · <b>+${r.p}점</b></p>` : ""}
+        ${brailleHTML(problemCells(q.a, q.b), {hlNum:true, labels:true, style:"--d:min(20px,3vw);--bgap:min(12px,1.6vw)"})}
+        <div class="eq">${q.a} × ${q.b} = ${q.choices[ans]}</div>
+        <p class="stat" style="margin-top:14px">내 점수 ${total()}점</p>
+      </div>`;
+    } else if (meta.state === "final") {
+      $app.innerHTML = `<div class="card center"><h2>최종 결과</h2>${podiumHTML(meta.podium || [])}<p class="stat">${esc(name)} 님의 점수: ${total()}점</p></div>`;
+    }
+  }
+}
+
+(async function start(){
+  try { DB = await connectDB(); } catch (e) { failScreen(e); return; }
+  const last = JSON.parse(sessionStorage.getItem(SKEY) || "null");
+  const room = params.get("room");
+  if (room && last && last.code === room) {
+    try {
+      const pid = await DB.auth.anon();
+      const me = await DB.get(R(room) + "/players/" + pid);
+      if (me) { studentRun(room, pid, me.name); return; }
+    } catch (e) { /* 아래에서 다시 입장 */ }
+  }
+  studentJoin();
+})();
+</script>
+</body>
+</html>

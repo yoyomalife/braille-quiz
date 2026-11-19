@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<title>점자 구구단 퀴즈 · 선생님</title>
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<div class="top"><h1>⠿ 점자 구구단 퀴즈 · 선생님</h1><span class="sp"></span><span class="badge" id="who"></span><a href="#" id="logout" style="display:none">로그아웃</a></div>
+<div class="demo" id="demoBar" style="display:none">데모 모드: Firebase 설정 전이라 로그인 없이 열리고, <b>같은 브라우저의 탭끼리만</b> 연결돼요.</div>
+<div class="wrap" id="app"></div>
+<script src="config.js"></script>
+<script src="common.js"></script>
+<script>
+/* =====================================================================
+   선생님 화면 (로그인 필요)
+   ===================================================================== */
+let DB;
+const TKEY = "bq_teacher";
+const POINTS = rank => Math.max(100 - rank * 5, 50); // 정답자 중 1등 100점, 한 명 늦을 때마다 -5점, 최소 50점
+const studentURL = code => new URL("index.html?room=" + code, location.href).href;
+
+/* ---------- 문제 만들기 ---------- */
+const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = rnd(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+function makeChoices(a, b){
+  const ans = a * b; const set = new Set();
+  const swap = ans >= 10 && ans % 11 !== 0 && ans % 10 !== 0 ? Number(String(ans).split("").reverse().join("")) : null;
+  const pool = shuffle([a * (b + 1), a * (b - 1), (a + 1) * b, (a - 1) * b, swap, ans + 10, ans - 10, ans + 1, ans - 1, ans + 2]);
+  for (const x of pool) { if (x && x > 0 && x !== ans && x < 100 && !set.has(x)) set.add(x); if (set.size === 3) break; }
+  const ch = shuffle([ans, ...set]); return {choices: ch, ans: ch.indexOf(ans)};
+}
+function makeQuiz(n, lo, hi){
+  const pairs = []; for (let a = lo; a <= hi; a++) for (let b = 2; b <= 9; b++) pairs.push([a, b]);
+  shuffle(pairs); const out = [];
+  for (let i = 0; i < n; i++) { const [a, b] = pairs[i % pairs.length]; out.push({a, b, ...makeChoices(a, b)}); }
+  return out;
+}
+const pubQuestions = quiz => { const pub = {}; quiz.forEach((q, i) => pub[i] = {a: q.a, b: q.b, choices: q.choices}); return pub; }; // 정답은 공개 전까지 저장 안 함
+
+/* ---------- 로그인 ---------- */
+function loginScreen(msg){
+  clearSubs(); setWho(""); document.getElementById("logout").style.display = "none";
+  $app.innerHTML = `
+  <div class="card login">
+    <h2>선생님 로그인</h2>
+    <p class="muted small">Firebase에 등록한 선생님 계정으로 로그인하세요.</p>
+    <label class="f">이메일</label><input class="inp" id="em" type="email" autocomplete="username">
+    <label class="f">비밀번호</label><input class="inp" id="pw" type="password" autocomplete="current-password">
+    <div class="warn" id="w">${esc(msg || "")}</div>
+    <button class="btn gold big" style="width:100%;margin-top:8px" id="go">로그인</button>
+  </div>`;
+  const go = async () => {
+    const w = document.getElementById("w");
+    try { await DB.auth.login(document.getElementById("em").value.trim(), document.getElementById("pw").value); afterLogin(); }
+    catch (e) { w.textContent = "이메일 또는 비밀번호를 확인해 주세요."; }
+  };
+  document.getElementById("go").onclick = go;
+  document.getElementById("pw").onkeydown = e => { if (e.key === "Enter") go(); };
+}
+async function afterLogin(){
+  const u = await DB.auth.current();
+  setWho(DB.demo ? "선생님 (데모)" : u.email);
+  if (!DB.demo) document.getElementById("logout").style.display = "inline";
+  const saved = JSON.parse(localStorage.getItem(TKEY) || "null");
+  if (saved && (await DB.get(R(saved.code) + "/meta").catch(() => null))) teacherRun(saved); else { localStorage.removeItem(TKEY); teacherSetup(); }
+}
+document.getElementById("logout").onclick = async e => { e.preventDefault(); await DB.auth.logout(); loginScreen(); };
+
+/* ---------- 방 만들기 ---------- */
+function teacherSetup(){
+  clearSubs(); clearTick();
+  $app.innerHTML = `
+  <div class="card" style="max-width:620px;margin:0 auto">
+    <h2>퀴즈 방 만들기</h2>
+    <label class="f">문제 수</label>
+    <select class="inp" id="n">${[5,8,10,12,15,20].map(x => `<option ${x === 10 ? "selected" : ""}>${x}</option>`).join("")}</select>
+    <div class="grid2">
+      <div><label class="f">몇 단부터</label><select class="inp" id="lo">${[2,3,4,5,6,7,8,9].map(x => `<option ${x === 2 ? "selected" : ""}>${x}</option>`).join("")}</select></div>
+      <div><label class="f">몇 단까지</label><select class="inp" id="hi">${[2,3,4,5,6,7,8,9].map(x => `<option ${x === 9 ? "selected" : ""}>${x}</option>`).join("")}</select></div>
+    </div>
+    <label class="f">제한 시간</label>
+    <select class="inp" id="lim"><option value="0">없음 (선생님이 정답 공개)</option><option value="20">20초</option><option value="30" selected>30초</option><option value="45">45초</option><option value="60">60초</option></select>
+    <label class="f">보기 표시</label>
+    <select class="inp" id="cb"><option value="0" selected>숫자로 (기본)</option><option value="1">점자로 (어려움)</option></select>
+    <label class="toggle"><input type="checkbox" id="hint"> 학생 화면에 숫자 점자표 힌트 보여 주기</label>
+    <div class="warn" id="w"></div>
+    <button class="btn gold big" style="width:100%;margin-top:10px" id="make">방 만들기</button>
+  </div>`;
+  document.getElementById("make").onclick = async () => {
+    const w = document.getElementById("w");
+    const n = +document.getElementById("n").value, lo = +document.getElementById("lo").value, hi = +document.getElementById("hi").value;
+    if (lo > hi) { w.textContent = "‘몇 단부터’가 ‘몇 단까지’보다 클 수 없어요."; return; }
+    try {
+      let code; for (let i = 0; i < 20; i++) { code = String(1000 + rnd(9000)); if (!(await DB.get(R(code) + "/meta"))) break; }
+      const settings = {n, lo, hi, limit: +document.getElementById("lim").value, choicesBraille: document.getElementById("cb").value === "1", hint: document.getElementById("hint").checked};
+      const quiz = makeQuiz(n, lo, hi);
+      await DB.set(R(code), {meta: {state: "lobby", q: -1, total: n, createdAt: TS, owner: DB.auth.uid(), ...settings}, questions: pubQuestions(quiz)});
+      const g = {code, quiz, settings}; localStorage.setItem(TKEY, JSON.stringify(g));
+      teacherRun(g);
+    } catch (e) { w.textContent = "방을 만들 권한이 없어요. 선생님 계정과 Firebase 규칙의 이메일을 확인해 주세요."; console.error(e); }
+  };
+}
+
+/* ---------- 진행 ---------- */
+function teacherRun(g){
+  clearSubs(); clearTick();
+  let meta = null, players = {}, answers = {}, results = {}, peek = false, pick = null;
+  unsubs.push(DB.on(R(g.code) + "/meta", v => { if (!v) { localStorage.removeItem(TKEY); teacherSetup(); return; } meta = v; render(); }));
+  unsubs.push(DB.on(R(g.code) + "/players", v => { players = v || {}; render(); }));
+  unsubs.push(DB.on(R(g.code) + "/answers", v => { answers = v || {}; render(); }));
+  unsubs.push(DB.on(R(g.code) + "/results", v => { results = v || {}; render(); }));
+
+  const totals = () => { const t = {}; for (const pid in players) t[pid] = 0; for (const qi in results) for (const pid in results[qi]) if (pid in t) t[pid] += results[qi][pid].p || 0; return t; };
+  const ranking = () => { const t = totals(); return Object.keys(players).map(pid => ({pid, name: players[pid].name, score: t[pid] || 0})).sort((x, y) => y.score - x.score || x.name.localeCompare(y.name, "ko")); };
+  const doneSet = () => new Set(Object.keys(results).map(Number));
+  const nextQ = () => { const d = doneSet(); for (let i = 0; i < g.quiz.length; i++) if (!d.has(i) && i !== meta.q) return i; return null; };
+
+  async function ask(i){ peek = false; pick = null; await DB.update(R(g.code) + "/meta", {state: "question", q: i, qs: String(i), startedAt: TS}); }
+  async function reveal(){
+    const i = meta.q, q = g.quiz[i], ans = answers[i] || {};
+    const limitMs = meta.limit ? meta.limit * 1000 + 1500 : Infinity;
+    const list = Object.entries(ans).filter(([pid]) => players[pid]).map(([pid, a]) => ({pid, ...a}));
+    const correct = list.filter(a => a.choice === q.ans && a.t - meta.startedAt <= limitMs).sort((x, y) => x.t - y.t);
+    const res = {}; for (const a of list) res[a.pid] = {c: false, p: 0};
+    correct.forEach((a, r) => res[a.pid] = {c: true, p: POINTS(r), r: r + 1, sec: Math.max(0, (a.t - meta.startedAt) / 1000)});
+    await DB.update(R(g.code), {[`results/${i}`]: Object.keys(res).length ? res : {_: {c: false, p: 0}}, [`reveal/${i}`]: q.ans, "meta/state": "reveal"});
+  }
+  async function finish(){ await DB.update(R(g.code) + "/meta", {state: "final", podium: ranking().slice(0, 3).map(x => ({name: x.name, score: x.score}))}); }
+  async function endRoom(){
+    if (!confirm("방을 닫고 기록을 지울까요?")) return;
+    localStorage.removeItem(TKEY); clearSubs(); await DB.remove(R(g.code)); teacherSetup();
+  }
+
+  function qPicker(){
+    const d = doneSet(); if (pick == null) pick = nextQ();
+    return `<div class="qnums">${g.quiz.map((_, i) => `<button class="qn ${d.has(i) ? "done" : ""} ${pick === i ? "sel" : ""}" data-q="${i}">${i + 1}</button>`).join("")}</div>`;
+  }
+  function choiceGrid(q, opt){
+    const cnt = [0,0,0,0]; for (const a of Object.values(answers[meta.q] || {})) if (a.choice >= 0) cnt[a.choice]++;
+    return `<div class="choices">${q.choices.map((c, k) => {
+      const face = meta.choicesBraille ? brailleHTML(numCells(c)) : c;
+      const cls = opt.reveal ? (k === q.ans ? "right" : "dim") : (opt.peek && k === q.ans ? "right" : "");
+      return `<button class="ch c${k} ${cls}" disabled><span class="k">${KEYS[k]}</span>${face}${opt.reveal ? `<span class="cnt">${cnt[k]}명</span>` : ""}</button>`;
+    }).join("")}</div>`;
+  }
+
+  function render(){
+    if (!meta) return; clearTick();
+    const pc = Object.keys(players).length;
+    if (meta.state === "lobby") {
+      $app.innerHTML = `
+      <div class="grid2">
+        <div class="card center">
+          <div class="muted">학생 참여 주소</div>
+          <div style="font-size:20px;font-weight:800;word-break:break-all;margin:6px 0 16px">${esc(studentURL(g.code))}</div>
+          <div class="muted">방 코드</div><div class="code">${g.code}</div>
+          <div class="stat" style="margin-top:10px">참여 ${pc}명</div>
+        </div>
+        <div class="card">
+          <h2>참여한 학생</h2>
+          <div>${Object.entries(players).map(([pid, p]) => `<span class="pill">${esc(p.name)}<button data-kick="${pid}" title="내보내기">✕</button></span>`).join("") || `<p class="muted">학생을 기다리는 중…</p>`}</div>
+          <div class="sep"></div>
+          <div class="muted small" style="margin-bottom:8px">낼 문제 번호를 고르세요 (기본: 다음 순서)</div>
+          ${qPicker()}
+          <button class="btn gold big" style="width:100%;margin-top:14px" id="ask" ${pc ? "" : "disabled"}>문제 내기</button>
+          <p class="center small" style="margin-top:12px"><a href="#" id="end">방 닫기</a></p>
+        </div>
+      </div>`;
+    } else if (meta.state === "question") {
+      const q = g.quiz[meta.q]; const n = Object.keys(answers[meta.q] || {}).filter(p => players[p]).length;
+      $app.innerHTML = `
+      <div class="card center">
+        <div class="row" style="justify-content:space-between">
+          <div class="stat">${meta.q + 1}번 문제 <span class="muted small">/ ${meta.total}</span></div>
+          <div class="timer" id="tm"></div>
+          <div class="stat">제출 ${n} / ${pc}</div>
+        </div>
+        ${brailleHTML(problemCells(q.a, q.b), {hlNum:true, style:"--d:30px;--bgap:16px"})}
+        ${peek ? `<div class="eq">${q.a} × ${q.b} = ${q.a * q.b}</div>` : `<div class="muted small">학생 화면에도 점자만 보여요</div>`}
+        ${choiceGrid(q, {peek})}
+        <div class="row" style="justify-content:center;margin-top:20px">
+          <button class="btn ghost" id="peek">${peek ? "정답 가리기" : "정답 미리보기(교사용)"}</button>
+          <button class="btn gold big" id="rev">정답 공개</button>
+        </div>
+      </div>`;
+      if (meta.limit) {
+        const el = document.getElementById("tm");
+        const upd = () => { const left = Math.max(0, Math.ceil(meta.limit - (DB.now() - meta.startedAt) / 1000)); el.textContent = left + "초"; el.classList.toggle("low", left <= 5); };
+        upd(); tick = setInterval(upd, 250);
+      }
+    } else if (meta.state === "reveal") {
+      const q = g.quiz[meta.q]; const res = results[meta.q] || {};
+      const fast = Object.entries(res).filter(([pid, r]) => r.c && players[pid]).sort((x, y) => x[1].r - y[1].r).slice(0, 5);
+      const nq = nextQ();
+      $app.innerHTML = `
+      <div class="grid2">
+        <div class="card center">
+          <div class="stat">${meta.q + 1}번 문제</div>
+          ${brailleHTML(problemCells(q.a, q.b), {hlNum:true, labels:true, style:"--d:20px"})}
+          <div class="eq">${q.a} × ${q.b} = ${q.a * q.b}</div>
+          ${choiceGrid(q, {reveal:true})}
+        </div>
+        <div class="card">
+          <h2>가장 빨리 맞힌 학생</h2>
+          <table class="rank">${fast.map(([pid, r]) => `<tr><td class="r">${r.r}</td><td>${esc(players[pid].name)}</td><td class="s">+${r.p}점 <span class="muted small">${r.sec != null ? r.sec.toFixed(1) + "초" : ""}</span></td></tr>`).join("") || `<tr><td class="muted">정답자가 없어요</td></tr>`}</table>
+          <div class="sep"></div>
+          <h2>누적 순위</h2>
+          <table class="rank">${ranking().slice(0, 5).map((x, i) => `<tr><td class="r">${i + 1}</td><td>${esc(x.name)}</td><td class="s">${x.score}점</td></tr>`).join("")}</table>
+          <div class="sep"></div>
+          ${nq != null ? `<div class="muted small" style="margin-bottom:8px">다음에 낼 문제 번호</div>${qPicker()}
+          <button class="btn gold big" style="width:100%;margin-top:14px" id="ask">문제 내기</button>` : ""}
+          <button class="btn ${nq != null ? "ghost" : "gold big"}" style="width:100%;margin-top:10px" id="fin">최종 결과 발표</button>
+        </div>
+      </div>`;
+    } else if (meta.state === "final") {
+      const rk = ranking();
+      $app.innerHTML = `
+      <div class="card center">
+        <h2>최종 결과</h2>${podiumHTML(meta.podium || [])}
+        <details style="margin-top:18px;text-align:left"><summary class="stat" style="cursor:pointer">전체 순위 보기</summary>
+          <table class="rank" style="margin-top:8px">${rk.map((x, i) => `<tr><td class="r">${i + 1}</td><td>${esc(x.name)}</td><td class="s">${x.score}점</td></tr>`).join("")}</table></details>
+        <div class="row" style="justify-content:center;margin-top:20px">
+          <button class="btn ghost" id="again">같은 학생들로 새 게임</button><button class="btn red" id="end">방 닫기</button>
+        </div>
+      </div>`;
+    }
+    $app.querySelectorAll("[data-kick]").forEach(b => b.onclick = () => { if (confirm("이 학생을 내보낼까요?")) DB.remove(R(g.code) + "/players/" + b.dataset.kick); });
+    $app.querySelectorAll("[data-q]").forEach(b => b.onclick = () => { pick = +b.dataset.q; render(); });
+    const on = (id, f) => { const el = document.getElementById(id); if (el) el.onclick = f; };
+    on("ask", () => { if (pick != null) ask(pick); });
+    on("rev", reveal); on("fin", finish); on("end", e => { e.preventDefault(); endRoom(); });
+    on("peek", () => { peek = !peek; render(); });
+    on("again", async () => {
+      g.quiz = makeQuiz(g.settings.n, g.settings.lo, g.settings.hi);
+      await DB.update(R(g.code), {questions: pubQuestions(g.quiz), answers: null, results: null, reveal: null, "meta/state": "lobby", "meta/q": -1, "meta/podium": null});
+      localStorage.setItem(TKEY, JSON.stringify(g)); pick = null;
+    });
+  }
+  setWho(`${DB.demo ? "선생님 (데모)" : ""} 방 ${g.code}`.trim());
+}
+
+(async function start(){
+  try { DB = await connectDB(); } catch (e) { failScreen(e); return; }
+  if (DB.demo) { afterLogin(); return; }
+  const u = await DB.auth.current();
+  if (u && !u.isAnonymous) afterLogin(); else loginScreen();
+})();
+</script>
+</body>
+</html>
