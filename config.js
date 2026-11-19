@@ -4,7 +4,15 @@
    아래 null 자리에 그대로 붙여 넣으세요. (databaseURL 꼭 포함)
    null 이면 '데모 모드'로 실행됩니다. (같은 브라우저의 탭끼리만 연결, 로그인 없음)
    ===================================================================== */
-window.FIREBASE_CONFIG = null;
+window.FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCEnQHWKzZuxC2nxm6fwy9U_jY4KfbfXuU",
+  authDomain: "braille-quiz-4f922.firebaseapp.com",
+  databaseURL: "https://braille-quiz-4f922-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "braille-quiz-4f922",
+  storageBucket: "braille-quiz-4f922.firebasestorage.app",
+  messagingSenderId: "770133873972",
+  appId: "1:770133873972:web:74aef87886ab36446b4161"
+};
 
 /* 예시)
 window.FIREBASE_CONFIG = {
